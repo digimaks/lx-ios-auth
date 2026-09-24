@@ -10,8 +10,12 @@
 import Security
 import Foundation
 import LocalAuthentication
+import CryptoKit
 import KeychainWrapperPackage
 import UtilitiesPackage
+import os
+
+private let authLog = Logger(subsystem: "lv.zzdats.AuthWrapperPackage", category: "passcode")
 
 final public class PasscodeManager: Sendable {
     
@@ -20,6 +24,7 @@ final public class PasscodeManager: Sendable {
     }
     
     fileprivate let KEY_SERVICE: String = "KEY_SERVICE"
+    fileprivate let KEY_SERVICE_SALT: String = "KEY_SERVICE_SALT"
     fileprivate let KEY_SERVICE_TOKEN: String = "KEY_SERVICE_TOKEN"
     fileprivate let KEY_SERVICE_BIOMETRY: String = "KEY_SERVICE_BIOMETRY"
     fileprivate let PASSCODE_SET_KEY = "PASSCODE_SET_KEY"
@@ -78,11 +83,25 @@ final public class PasscodeManager: Sendable {
     }
     
     public func storePasscode(passcode: String, completion: @escaping (Bool) -> Void) {
-        if let passcodeData = KeychainManager.shared.convertToData(item: passcode) {
+        guard let passcodeData = KeychainManager.shared.convertToData(item: passcode) else {
+            completion(false)
+            return
+        }
+        
+        let salt = Self.generateSalt()
+        let hashedPasscode = Self.derivedKey(forPasscode: passcodeData, salt: salt)
+        
+        storeSalt(salt, completion: { saltStored in
+            guard saltStored else {
+                completion(false)
+                return
+            }
+            
             let query = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: self.KEY_SERVICE,
-                kSecValueData as String: passcodeData,
+                kSecValueData as String: hashedPasscode,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
             ] as CFDictionary
             
             KeychainManager.shared.addItemToKeychain(query: query, completion: { success in
@@ -92,29 +111,41 @@ final public class PasscodeManager: Sendable {
                 
                 completion(success)
             })
-        }
+        })
     }
     
     public func updatePasscode(passcode: String, completion: @escaping (Bool) -> Void) {
-        if let passcodeData = KeychainManager.shared.convertToData(item: passcode) {
+        guard let passcodeData = KeychainManager.shared.convertToData(item: passcode) else {
+            completion(false)
+            return
+        }
+        
+        let salt = Self.generateSalt()
+        let hashedPasscode = Self.derivedKey(forPasscode: passcodeData, salt: salt)
+        
+        storeSalt(salt, completion: { saltStored in
+            guard saltStored else {
+                completion(false)
+                return
+            }
+            
             let query = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: self.KEY_SERVICE,
             ] as CFDictionary
             
             let updateFields = [
-                kSecValueData as String: passcodeData,
+                kSecValueData as String: hashedPasscode,
             ] as CFDictionary
             
             KeychainManager.shared.updateKeychainItem(query: query, updateField: updateFields, completion: { success in
                 if success {
-                    // Drop biometry
                     self.deleteBiometricAuthentication()
                 }
                 
                 completion(success)
             })
-        }
+        })
     }
     
     public func storePasscodeWithBiometry(passcode: String) async throws -> Bool {
@@ -159,13 +190,34 @@ final public class PasscodeManager: Sendable {
             kSecMatchLimit as String: kSecMatchLimitOne
         ] as CFDictionary
         
-        KeychainManager.shared.retrieve(query: query, completion: { passcodeKeychain in
-            guard let passcodeKeychain = passcodeKeychain else {
+        guard let salt = getSalt() else {
+            KeychainManager.shared.retrieve(query: query, completion: { [weak self] storedValue in
+                guard let self = self, let storedValue = storedValue else {
+                    completion(false)
+                    return
+                }
+                
+                guard storedValue == passcode else {
+                    completion(false)
+                    return
+                }
+                
+                self.upgradeLegacyPasscode(passcode, completion: { _ in
+                    completion(true)
+                })
+            })
+            return
+        }
+        
+        let expectedHash = Self.derivedKey(forPasscode: passcode, salt: salt)
+        
+        KeychainManager.shared.retrieve(query: query, completion: { storedHash in
+            guard let storedHash = storedHash else {
                 completion(false)
                 return
             }
             
-            completion(passcodeKeychain == passcode)
+            completion(Self.constantTimeEquals(storedHash, expectedHash))
         })
     }
     
@@ -199,15 +251,15 @@ final public class PasscodeManager: Sendable {
         let status = SecItemDelete(query)
         if status == errSecSuccess {
             BiometricsManager.shared.removeBiometricsSwitchState()
-            print("Biometry login dropped")
+            authLog.debug("Biometry login dropped")
         } else {
-            print("Cannot drop biometry login")
+            authLog.error("Cannot drop biometry login")
         }
         
         KeychainManager.shared.delete(query: query, completion: { success in
             if success {
                 BiometricsManager.shared.removeBiometricsSwitchState()
-                print("Biometry login dropped")
+                authLog.debug("Biometry login dropped")
             }
         })
     }
@@ -222,7 +274,7 @@ final public class PasscodeManager: Sendable {
             if success {
                 self.setPasscodeSetKey(isOn: false)
                 BiometricsManager.shared.removeBiometricsSwitchState()
-                print("All login information dropped")
+                authLog.debug("All login information dropped")
             }
             
             completion(success)
@@ -365,5 +417,86 @@ final public class PasscodeManager: Sendable {
             
             completion(mins)
         })
+    }
+}
+
+extension PasscodeManager {
+    fileprivate static func derivedKey(forPasscode passcodeData: Data, salt: Data) -> Data {
+        let key = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: passcodeData),
+            salt: salt,
+            info: Data("lv.edim.passcode.v1".utf8),
+            outputByteCount: 32
+        )
+        return key.withUnsafeBytes { Data($0) }
+    }
+    
+    fileprivate static func generateSalt() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes)
+    }
+    
+    fileprivate func storeSalt(_ salt: Data, completion: @escaping (Bool) -> Void) {
+        let query = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: self.KEY_SERVICE_SALT,
+            kSecValueData as String: salt,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+        ] as CFDictionary
+        
+        KeychainManager.shared.addItemToKeychain(query: query, completion: completion)
+    }
+    
+    fileprivate func getSalt() -> Data? {
+        let query = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: self.KEY_SERVICE_SALT,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ] as CFDictionary
+        
+        guard let result = try? KeychainManager.shared.throwRetrieve(query: query) else {
+            return nil
+        }
+        
+        return result
+    }
+    
+    /// Re-stores an already-verified legacy plaintext passcode as a salted hash,
+    /// so the plaintext value is removed from the Keychain on first successful
+    /// unlock after updating.
+    fileprivate func upgradeLegacyPasscode(_ passcode: Data, completion: @escaping (Bool) -> Void) {
+        let salt = Self.generateSalt()
+        let hashedPasscode = Self.derivedKey(forPasscode: passcode, salt: salt)
+        
+        storeSalt(salt, completion: { [weak self] saltStored in
+            guard let self = self, saltStored else {
+                completion(false)
+                return
+            }
+            
+            let query = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: self.KEY_SERVICE,
+                kSecValueData as String: hashedPasscode,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+            ] as CFDictionary
+            
+            KeychainManager.shared.addItemToKeychain(query: query, completion: completion)
+        })
+    }
+    
+    /// Compares two digests without early exit, so comparison time does not depend
+    /// on how many leading bytes matched.
+    fileprivate static func constantTimeEquals(_ lhs: Data, _ rhs: Data) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        
+        var difference: UInt8 = 0
+        for (left, right) in zip(lhs, rhs) {
+            difference |= left ^ right
+        }
+        
+        return difference == 0
     }
 }

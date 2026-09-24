@@ -11,6 +11,7 @@ import Foundation
 import LocalAuthentication
 import UtilitiesPackage
 
+@available(iOS 15.0, macOS 10.15, *)
 final public class BiometricsManager: Sendable  {
     
     fileprivate let BIOMETRIC_SWITCH_KEY = "BIOMETRIC_SWITCH_KEY"
